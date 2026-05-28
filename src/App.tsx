@@ -680,6 +680,7 @@ function exportRunAsJson(run: SimulationRun) {
     finalSummary: run.finalSummary,
     highlights: run.highlights,
     rlTraining: run.rlTraining,
+    agentTraining: run.agentTraining,
     yearlyMetrics: yearlyFrames.map((frame) => ({
       year: frame.year,
       policy: frame.activePolicyName,
@@ -1198,7 +1199,7 @@ function App() {
         <section className="insight-panel glass-panel">
           <div className="panel-header">
             <span>策略读数</span>
-            <small>{isRL ? "Q-learning 已启用" : "固定策略"}</small>
+            <small>{isRL ? "双层 Q-learning 已启用" : "行动 Q-learning 已启用"}</small>
           </div>
 
           {defenseMode ? <DefenseSummary run={run} frame={frame} /> : null}
@@ -1243,6 +1244,40 @@ function App() {
                 房屋：{selectedAgent.houses}
               </span>
               <span>累计种树：{selectedAgent.plantedTrees}</span>
+            </div>
+          </div>
+
+          <div className="agent-detail rl-panel">
+            <div className="agent-detail-head">
+              <span>个体行动学习</span>
+              <strong>Q-learning</strong>
+            </div>
+            <p>每个 Agent 的采集、采石、种树、建造、交易、移动和休整由行动价值表选择。</p>
+            <div className="agent-detail-grid">
+              <span>训练轮数：{run.agentTraining.episodes}</span>
+              <span>状态数量：{run.agentTraining.learnedStates}</span>
+              <span>平均回报：{run.agentTraining.averageReward.toFixed(2)}</span>
+              <span>探索率：{run.agentTraining.epsilonStart} → {run.agentTraining.epsilonEnd}</span>
+            </div>
+            <div className="action-breakdown action-breakdown-compact">
+              {(Object.entries(run.agentTraining.actionUsage) as [ActionType, number][]).map(([key, value]) => (
+                <div key={key} className="action-row">
+                  <label>
+                    <ActionIcon action={key} />
+                    <span>{actionLabel(key)}</span>
+                  </label>
+                  <div className="action-bar-track">
+                    <span
+                      className="action-bar-fill"
+                      style={{
+                        width: `${Math.max(4, (value / Math.max(...Object.values(run.agentTraining.actionUsage), 1)) * 100)}%`,
+                        background: ACTION_COLORS[key]
+                      }}
+                    />
+                  </div>
+                  <strong>{value}</strong>
+                </div>
+              ))}
             </div>
           </div>
 

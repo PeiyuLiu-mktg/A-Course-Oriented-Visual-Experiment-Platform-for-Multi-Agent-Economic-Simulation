@@ -126,6 +126,18 @@ export type RLTrainingSummary = {
   policyTrace: RLPolicyTrace[];
 };
 
+export type AgentActionTrainingSummary = {
+  algorithm: "Q-learning";
+  episodes: number;
+  alpha: number;
+  gamma: number;
+  epsilonStart: number;
+  epsilonEnd: number;
+  averageReward: number;
+  learnedStates: number;
+  actionUsage: ActionSummary;
+};
+
 export type SimulationRun = {
   config: ScenarioConfig;
   policy: Policy;
@@ -133,6 +145,7 @@ export type SimulationRun = {
   highlights: string[];
   finalSummary: string;
   rlTraining: RLTrainingSummary | null;
+  agentTraining: AgentActionTrainingSummary;
 };
 
 type MacroMetrics = {
@@ -168,7 +181,40 @@ type QLearningBundle = {
   choosePolicy: (year: number, metrics: MacroMetrics) => RLPolicyTrace;
 };
 
+type AgentLearningSignal = {
+  wealth: number;
+  wood: number;
+  stone: number;
+  seeds: number;
+  houses: number;
+  plantedTrees: number;
+  soldValue: number;
+  energy: number;
+  productivityAccumulator: number;
+  ecologyScore: number;
+};
+
+type AgentActionPlanner = {
+  chooseAction: (
+    agent: AgentState,
+    runtime: RuntimeState,
+    config: ScenarioConfig,
+    policy: Policy,
+    year: number,
+    step: number
+  ) => ActionType;
+  observe?: (state: string, action: ActionType, reward: number, nextState: string) => void;
+  actionUsage?: ActionSummary;
+};
+
+type AgentActionBundle = {
+  summary: AgentActionTrainingSummary;
+  createPlanner: (random: () => number) => AgentActionPlanner;
+};
+
 const COLORS = ["#f26d5b", "#f0b454", "#53c7b9", "#6fa8ff", "#ee89d6", "#b3d45c", "#7ce38b", "#ff9e7c"];
+const LEARNABLE_AGENT_ACTIONS: ActionType[] = ["harvest", "mine", "plant", "build", "trade", "move", "rest"];
+const PRODUCTIVITY_NORMALIZER = 1.4;
 const ROLE_LABELS: Record<AgentRole, string> = {
   gatherer: "采集者",
   builder: "建造者",
@@ -401,6 +447,166 @@ function createInitialMetrics(runtime: RuntimeState): MacroMetrics {
   };
 }
 
+function nearestMatureTree(runtime: RuntimeState, agent: AgentState): ResourceNode | undefined {
+  return runtime.resources
+    .filter((node) => node.kind === "tree" && node.amount > 0 && node.stage === "mature")
+    .sort((a, b) => distance(agent, a) - distance(agent, b))[0];
+}
+
+function nearestStone(runtime: RuntimeState, agent: AgentState): ResourceNode | undefined {
+  return runtime.resources
+    .filter((node) => node.kind === "stone" && node.amount > 0)
+    .sort((a, b) => distance(agent, a) - distance(agent, b))[0];
+}
+
+function marketPoint(config: ScenarioConfig): CellPoint {
+  return { x: Math.floor(config.mapWidth / 2), y: Math.floor(config.mapHeight / 2) };
+}
+
+function bucket3(value: number): string {
+  if (value < 0.34) {
+    return "L";
+  }
+  if (value < 0.67) {
+    return "M";
+  }
+  return "H";
+}
+
+function encodeAgentActionState(
+  agent: AgentState,
+  runtime: RuntimeState,
+  config: ScenarioConfig,
+  policy: Policy,
+  year: number
+): string {
+  const market = marketPoint(config);
+  const tree = nearestMatureTree(runtime, agent);
+  const stone = nearestStone(runtime, agent);
+  const avgWealth = average(runtime.agents.map((item) => item.wealth));
+  const wealthBand = agent.wealth < avgWealth * 0.82 ? "poor" : agent.wealth > avgWealth * 1.18 ? "rich" : "mid";
+  const inventory =
+    agent.wood >= 2 && agent.stone >= 2
+      ? "buildReady"
+      : agent.wood + agent.stone >= 2
+        ? "sellReady"
+        : agent.wood > agent.stone
+          ? "wood"
+          : agent.stone > agent.wood
+            ? "stone"
+            : "empty";
+  const phase = year <= 3 ? "early" : year <= 7 ? "mid" : "late";
+
+  return [
+    agent.role,
+    policy.id,
+    config.objective,
+    phase,
+    wealthBand,
+    inventory,
+    agent.seeds > 0 ? "seed" : "noSeed",
+    agent.energy > 68 ? "highEnergy" : agent.energy > 42 ? "midEnergy" : "lowEnergy",
+    tree ? bucket3(1 - distance(agent, tree) / Math.max(config.mapWidth, config.mapHeight)) : "noTree",
+    stone ? bucket3(1 - distance(agent, stone) / Math.max(config.mapWidth, config.mapHeight)) : "noStone",
+    agent.x === market.x && agent.y === market.y ? "atMarket" : "awayMarket",
+    bucket3(runtime.ecologyScore)
+  ].join("|");
+}
+
+function getAvailableAgentActions(agent: AgentState, runtime: RuntimeState, config: ScenarioConfig): ActionType[] {
+  const actions: ActionType[] = [];
+  if (nearestMatureTree(runtime, agent)) {
+    actions.push("harvest");
+  }
+  if (nearestStone(runtime, agent)) {
+    actions.push("mine");
+  }
+  if (agent.seeds > 0) {
+    actions.push("plant");
+  }
+  if (agent.wood >= 2 && agent.stone >= 2) {
+    actions.push("build");
+  }
+  if (agent.wood + agent.stone > 0 || distance(agent, marketPoint(config)) > 0) {
+    actions.push("trade");
+  }
+  actions.push("move", "rest");
+  return actions;
+}
+
+function ensureAgentQRow(table: Map<string, number[]>, state: string): number[] {
+  if (!table.has(state)) {
+    table.set(state, Array.from({ length: LEARNABLE_AGENT_ACTIONS.length }, () => 0));
+  }
+  return table.get(state)!;
+}
+
+function chooseAgentActionFromQ(
+  qValues: number[],
+  availableActions: ActionType[],
+  random: () => number,
+  epsilon: number
+): ActionType {
+  if (random() < epsilon) {
+    return availableActions[Math.floor(random() * availableActions.length)] ?? "rest";
+  }
+
+  let bestAction = availableActions[0] ?? "rest";
+  let bestValue = Number.NEGATIVE_INFINITY;
+  for (const action of availableActions) {
+    const value = qValues[LEARNABLE_AGENT_ACTIONS.indexOf(action)] ?? 0;
+    if (value > bestValue) {
+      bestValue = value;
+      bestAction = action;
+    }
+  }
+  return bestAction;
+}
+
+function captureAgentLearningSignal(agent: AgentState, runtime: RuntimeState): AgentLearningSignal {
+  return {
+    wealth: agent.wealth,
+    wood: agent.wood,
+    stone: agent.stone,
+    seeds: agent.seeds,
+    houses: agent.houses,
+    plantedTrees: agent.plantedTrees,
+    soldValue: agent.soldValue,
+    energy: agent.energy,
+    productivityAccumulator: runtime.productivityAccumulator,
+    ecologyScore: runtime.ecologyScore
+  };
+}
+
+function computeAgentActionReward(
+  before: AgentLearningSignal,
+  agent: AgentState,
+  runtime: RuntimeState,
+  config: ScenarioConfig
+): number {
+  const wealthGain = agent.wealth - before.wealth;
+  const inventoryGain = agent.wood + agent.stone + agent.seeds * 0.5 - (before.wood + before.stone + before.seeds * 0.5);
+  const houseGain = agent.houses - before.houses;
+  const plantGain = agent.plantedTrees - before.plantedTrees;
+  const tradeGain = agent.soldValue - before.soldValue;
+  const productivityGain = runtime.productivityAccumulator - before.productivityAccumulator;
+  const ecologyGain = runtime.ecologyScore - before.ecologyScore;
+  const energyLoss = Math.max(before.energy - agent.energy, 0);
+  const ecologyWeight = config.objective === "productivity" ? 2.2 : 4.2;
+  const productivityWeight = config.objective === "equality" ? 1.8 : 2.8;
+
+  return (
+    wealthGain * 0.22 +
+    inventoryGain * 0.18 +
+    houseGain * 2.4 +
+    plantGain * (config.objective === "productivity" ? 0.9 : 1.6) +
+    tradeGain * 0.1 +
+    productivityGain * productivityWeight +
+    ecologyGain * ecologyWeight -
+    energyLoss * 0.015
+  );
+}
+
 function createRuntime(config: ScenarioConfig, seed: number): RuntimeState {
   const random = mulberry32(seed);
   const resources: ResourceNode[] = [];
@@ -510,15 +716,199 @@ function computeReward(metrics: MacroMetrics, objective: ObjectiveId): number {
   return metrics.welfare * 0.6 + metrics.ecology * 0.15 + metrics.equality * 0.15 + metrics.productivity * 0.1;
 }
 
+function moveByLearningIntent(
+  agent: AgentState,
+  runtime: RuntimeState,
+  config: ScenarioConfig,
+  actionSummary: ActionSummary
+): void {
+  const market = marketPoint(config);
+  const tree = nearestMatureTree(runtime, agent);
+  const stone = nearestStone(runtime, agent);
+  const target =
+    agent.wood >= 2 && agent.stone >= 2
+      ? market
+      : agent.wood < 2 && tree
+        ? tree
+        : agent.stone < 2 && stone
+          ? stone
+          : tree ?? stone ?? market;
+
+  moveToward(agent, target, config.mapWidth, config.mapHeight);
+  agent.lastAction = target === market ? "前往市场" : target === stone ? "前往矿区" : "前往树林";
+  agent.actionType = "move";
+  actionSummary.move += 1;
+}
+
+function executeAgentAction(
+  requestedAction: ActionType,
+  agent: AgentState,
+  runtime: RuntimeState,
+  config: ScenarioConfig,
+  policy: Policy,
+  year: number,
+  events: string[],
+  actionSummary: ActionSummary
+): void {
+  const market = marketPoint(config);
+  const matureTree = nearestMatureTree(runtime, agent);
+  const stoneNode = nearestStone(runtime, agent);
+  const ecologyBias = policy.ecologyBoost + (config.objective === "equality" ? 0.04 : 0);
+
+  if (requestedAction === "build" && agent.wood >= 2 && agent.stone >= 2) {
+    agent.wood -= 2;
+    agent.stone -= 2;
+    const reward = 8 * policy.buildReward;
+    agent.wealth += reward;
+    agent.incomeYear += reward;
+    agent.houses += 1;
+    if (!runtime.houses.some((house) => house.x === agent.x && house.y === agent.y)) {
+      runtime.houses.push({
+        id: runtime.nextHouseId,
+        x: agent.x,
+        y: agent.y,
+        ownerId: agent.id,
+        yearBuilt: year
+      });
+      runtime.nextHouseId += 1;
+    }
+    runtime.productivityAccumulator += reward * 0.16;
+    agent.lastAction = "建造房屋";
+    agent.actionType = "build";
+    actionSummary.build += 1;
+    if (events.length < 4) {
+      events.push(`A${agent.id + 1} 按行动策略完成了一处房屋建设。`);
+    }
+    return;
+  }
+
+  if (requestedAction === "trade") {
+    moveToward(agent, market, config.mapWidth, config.mapHeight);
+    if (agent.x === market.x && agent.y === market.y && agent.wood + agent.stone > 0) {
+      const sold = agent.wood * 2.3 + agent.stone * 2.6;
+      const tradeIncome = sold * policy.tradeBonus;
+      agent.wealth += tradeIncome;
+      agent.incomeYear += tradeIncome;
+      agent.soldValue += tradeIncome;
+      runtime.productivityAccumulator += sold * 0.1;
+      runtime.marketHeat = clamp(runtime.marketHeat + 0.02, 0, 1);
+      agent.wood = 0;
+      agent.stone = 0;
+      agent.lastAction = "市场交易";
+      agent.actionType = "trade";
+      actionSummary.trade += 1;
+      if (events.length < 4) {
+        events.push(`A${agent.id + 1} 根据学习策略完成交易，成交额 ${tradeIncome.toFixed(1)}。`);
+      }
+    } else {
+      agent.lastAction = "前往市场";
+      agent.actionType = "move";
+      actionSummary.move += 1;
+    }
+    return;
+  }
+
+  if (requestedAction === "plant" && agent.seeds > 0) {
+    const spot = getEmptyTile(runtime.resources, runtime.agents, config.mapWidth, config.mapHeight, runtime.random);
+    moveToward(agent, spot, config.mapWidth, config.mapHeight);
+    if (agent.x === spot.x && agent.y === spot.y) {
+      runtime.resources.push({
+        id: runtime.nextResourceId,
+        x: spot.x,
+        y: spot.y,
+        kind: "tree",
+        amount: 1,
+        stage: "sapling",
+        regrowIn: 3
+      });
+      runtime.nextResourceId += 1;
+      agent.seeds -= 1;
+      agent.plantedTrees += 1;
+      agent.wealth += 0.8;
+      agent.incomeYear += 0.8;
+      runtime.ecologyScore = clamp(runtime.ecologyScore + 0.018 + ecologyBias * 0.02, 0, 1);
+      agent.lastAction = "种下树苗";
+      agent.actionType = "plant";
+      actionSummary.plant += 1;
+      if (events.length < 4) {
+        events.push(`A${agent.id + 1} 的行动策略选择种树，补充了一棵新树。`);
+      }
+    } else {
+      agent.lastAction = "移动到林地";
+      agent.actionType = "move";
+      actionSummary.move += 1;
+    }
+    return;
+  }
+
+  if (requestedAction === "harvest" && matureTree) {
+    moveToward(agent, matureTree, config.mapWidth, config.mapHeight);
+    if (agent.x === matureTree.x && agent.y === matureTree.y && matureTree.amount > 0) {
+      matureTree.amount = 0;
+      matureTree.stage = "sapling";
+      matureTree.regrowIn = 4;
+      agent.wood += 1;
+      agent.seeds += runtime.random() > 0.55 ? 1 : 0;
+      agent.wealth += 1.7;
+      agent.incomeYear += 1.7;
+      runtime.productivityAccumulator += 0.12;
+      runtime.ecologyScore = clamp(runtime.ecologyScore - 0.012, 0, 1);
+      agent.lastAction = "砍树取木";
+      agent.actionType = "harvest";
+      actionSummary.harvest += 1;
+      if (events.length < 4) {
+        events.push(`A${agent.id + 1} 的行动策略选择砍树取木。`);
+      }
+    } else {
+      agent.lastAction = "前往树林";
+      agent.actionType = "move";
+      actionSummary.move += 1;
+    }
+    return;
+  }
+
+  if (requestedAction === "mine" && stoneNode) {
+    moveToward(agent, stoneNode, config.mapWidth, config.mapHeight);
+    if (agent.x === stoneNode.x && agent.y === stoneNode.y && stoneNode.amount > 0) {
+      stoneNode.amount -= 1;
+      agent.stone += 1;
+      agent.wealth += 1.9;
+      agent.incomeYear += 1.9;
+      runtime.productivityAccumulator += 0.1;
+      agent.lastAction = "采石";
+      agent.actionType = "mine";
+      actionSummary.mine += 1;
+      if (events.length < 4) {
+        events.push(`A${agent.id + 1} 的行动策略选择到矿区采石。`);
+      }
+    } else {
+      agent.lastAction = "前往矿区";
+      agent.actionType = "move";
+      actionSummary.move += 1;
+    }
+    return;
+  }
+
+  if (requestedAction === "move") {
+    moveByLearningIntent(agent, runtime, config, actionSummary);
+    return;
+  }
+
+  agent.energy = clamp(agent.energy + 2.2, 30, 100);
+  agent.lastAction = "休整";
+  agent.actionType = "rest";
+  actionSummary.rest += 1;
+}
+
 function simulateYear(
   runtime: RuntimeState,
   config: ScenarioConfig,
   policy: Policy,
   year: number,
-  frames: StepSnapshot[] | null
+  frames: StepSnapshot[] | null,
+  agentActionPlanner?: AgentActionPlanner
 ): YearSimulationResult {
   for (let step = 0; step < config.stepsPerYear; step += 1) {
-    const market = { x: Math.floor(config.mapWidth / 2), y: Math.floor(config.mapHeight / 2) };
     const events: string[] = [];
     const actionSummary = seedActionSummary();
 
@@ -542,168 +932,38 @@ function simulateYear(
     }
 
     for (const agent of runtime.agents) {
-      const matureTree = runtime.resources
-        .filter((node) => node.kind === "tree" && node.amount > 0 && node.stage === "mature")
-        .sort((a, b) => distance(agent, a) - distance(agent, b))[0];
-      const stoneNode = runtime.resources
-        .filter((node) => node.kind === "stone" && node.amount > 0)
-        .sort((a, b) => distance(agent, a) - distance(agent, b))[0];
-
       const fairnessPressure = policy.fairnessWeight + (config.objective === "equality" ? 0.1 : 0);
-      const productivityBias =
-        (config.objective === "productivity" ? 0.12 : 0) + policy.buildReward * 0.05;
-      const ecologyBias = policy.ecologyBoost + (config.objective === "equality" ? 0.04 : 0);
+      const state = encodeAgentActionState(agent, runtime, config, policy, year);
+      const before = captureAgentLearningSignal(agent, runtime);
 
       agent.actionType = "rest";
       agent.lastAction = "观察局势";
+      const selectedAction =
+        agentActionPlanner?.chooseAction(agent, runtime, config, policy, year, step) ??
+        chooseAgentActionFromQ(
+          LEARNABLE_AGENT_ACTIONS.map((action) => (action === "rest" ? 0.01 : 0)),
+          getAvailableAgentActions(agent, runtime, config),
+          runtime.random,
+          0.16
+        );
 
-      const shouldPlant =
-        (agent.role === "forester" || (agent.role === "gatherer" && runtime.ecologyScore < 0.46)) &&
-        agent.seeds > 0 &&
-        runtime.random() > 0.42 - ecologyBias;
-
-      if (
-        agent.role === "builder" &&
-        agent.wood >= 2 &&
-        agent.stone >= 2 &&
-        runtime.random() > 0.34 - productivityBias
-      ) {
-        agent.wood -= 2;
-        agent.stone -= 2;
-        const reward = 8 * policy.buildReward;
-        agent.wealth += reward;
-        agent.incomeYear += reward;
-        agent.houses += 1;
-        if (!runtime.houses.some((house) => house.x === agent.x && house.y === agent.y)) {
-          runtime.houses.push({
-            id: runtime.nextHouseId,
-            x: agent.x,
-            y: agent.y,
-            ownerId: agent.id,
-            yearBuilt: year
-          });
-          runtime.nextHouseId += 1;
-        }
-        runtime.productivityAccumulator += reward * 0.08;
-        agent.lastAction = "建造房屋";
-        agent.actionType = "build";
-        actionSummary.build += 1;
-        if (events.length < 4) {
-          events.push(`A${agent.id + 1} 完成了一处房屋建设。`);
-        }
-      } else if (
-        agent.role === "trader" &&
-        (agent.wood + agent.stone >= 2 || runtime.random() > 0.68 - policy.tradeBonus * 0.12)
-      ) {
-        moveToward(agent, market, config.mapWidth, config.mapHeight);
-        if (agent.x === market.x && agent.y === market.y) {
-          const sold = agent.wood * 2.3 + agent.stone * 2.6;
-          const tradeIncome = sold * policy.tradeBonus;
-          agent.wealth += tradeIncome;
-          agent.incomeYear += tradeIncome;
-          agent.soldValue += tradeIncome;
-          runtime.productivityAccumulator += sold * 0.05;
-          runtime.marketHeat = clamp(runtime.marketHeat + 0.02, 0, 1);
-          agent.wood = 0;
-          agent.stone = 0;
-          agent.lastAction = "市场交易";
-          agent.actionType = "trade";
-          actionSummary.trade += 1;
-          if (events.length < 4) {
-            events.push(`A${agent.id + 1} 在市场完成一笔交易，成交额 ${tradeIncome.toFixed(1)}。`);
-          }
-        } else {
-          agent.lastAction = "前往市场";
-          agent.actionType = "move";
-          actionSummary.move += 1;
-        }
-      } else if (shouldPlant) {
-        const spot = getEmptyTile(runtime.resources, runtime.agents, config.mapWidth, config.mapHeight, runtime.random);
-        moveToward(agent, spot, config.mapWidth, config.mapHeight);
-        if (agent.x === spot.x && agent.y === spot.y) {
-          runtime.resources.push({
-            id: runtime.nextResourceId,
-            x: spot.x,
-            y: spot.y,
-            kind: "tree",
-            amount: 1,
-            stage: "sapling",
-            regrowIn: 3
-          });
-          runtime.nextResourceId += 1;
-          agent.seeds -= 1;
-          agent.plantedTrees += 1;
-          agent.wealth += 0.8;
-          agent.incomeYear += 0.8;
-          runtime.ecologyScore = clamp(runtime.ecologyScore + 0.018 + ecologyBias * 0.02, 0, 1);
-          agent.lastAction = "种下树苗";
-          agent.actionType = "plant";
-          actionSummary.plant += 1;
-          if (events.length < 4) {
-            events.push(`A${agent.id + 1} 正在扩张林地，种下了一棵新树。`);
-          }
-        } else {
-          agent.lastAction = "移动到林地";
-          agent.actionType = "move";
-          actionSummary.move += 1;
-        }
-      } else if (matureTree && (agent.role !== "builder" || agent.wood < 2)) {
-        moveToward(agent, matureTree, config.mapWidth, config.mapHeight);
-        if (agent.x === matureTree.x && agent.y === matureTree.y && matureTree.amount > 0) {
-          matureTree.amount = 0;
-          matureTree.stage = "sapling";
-          matureTree.regrowIn = 4;
-          agent.wood += 1;
-          agent.seeds += runtime.random() > 0.55 ? 1 : 0;
-          agent.wealth += 1.7;
-          agent.incomeYear += 1.7;
-          runtime.productivityAccumulator += 0.06;
-          runtime.ecologyScore = clamp(runtime.ecologyScore - 0.012, 0, 1);
-          agent.lastAction = "砍树取木";
-          agent.actionType = "harvest";
-          actionSummary.harvest += 1;
-          if (events.length < 4) {
-            events.push(`A${agent.id + 1} 砍下一棵成熟树木，补充了木材库存。`);
-          }
-        } else {
-          agent.lastAction = "前往树林";
-          agent.actionType = "move";
-          actionSummary.move += 1;
-        }
-      } else if (stoneNode) {
-        moveToward(agent, stoneNode, config.mapWidth, config.mapHeight);
-        if (agent.x === stoneNode.x && agent.y === stoneNode.y && stoneNode.amount > 0) {
-          stoneNode.amount -= 1;
-          agent.stone += 1;
-          agent.wealth += 1.9;
-          agent.incomeYear += 1.9;
-          runtime.productivityAccumulator += 0.05;
-          agent.lastAction = "采石";
-          agent.actionType = "mine";
-          actionSummary.mine += 1;
-          if (events.length < 4) {
-            events.push(`A${agent.id + 1} 在矿区采到一块石材。`);
-          }
-        } else {
-          agent.lastAction = "前往矿区";
-          agent.actionType = "move";
-          actionSummary.move += 1;
-        }
-      } else {
-        agent.energy = clamp(agent.energy + 2.2, 30, 100);
-        agent.lastAction = "休整";
-        agent.actionType = "rest";
-        actionSummary.rest += 1;
-      }
+      agentActionPlanner?.actionUsage && (agentActionPlanner.actionUsage[selectedAction] += 1);
+      executeAgentAction(selectedAction, agent, runtime, config, policy, year, events, actionSummary);
 
       const laborDrain =
         policy.laborCost +
         agent.houses * 0.03 -
         fairnessPressure * 0.08 +
-        (agent.actionType === "plant" ? -0.08 : 0);
+        ((agent.actionType as ActionType) === "plant" ? -0.08 : 0);
       agent.energy = clamp(agent.energy - laborDrain + 0.6, 30, 100);
       agent.wealth = clamp(agent.wealth - laborDrain * 0.18, 0, 999);
       updateRecentPath(agent);
+
+      if (agentActionPlanner?.observe) {
+        const nextState = encodeAgentActionState(agent, runtime, config, policy, year);
+        const reward = computeAgentActionReward(before, agent, runtime, config);
+        agentActionPlanner.observe(state, selectedAction, reward, nextState);
+      }
     }
 
     const matureTrees = runtime.resources.filter((node) => node.kind === "tree" && node.stage === "mature").length;
@@ -717,7 +977,7 @@ function simulateYear(
     );
 
     const denominator = (year - 1) * config.stepsPerYear + step + 1;
-    const productivity = clamp(runtime.productivityAccumulator / (denominator * 3.6), 0, 1);
+    const productivity = clamp(runtime.productivityAccumulator / (denominator * PRODUCTIVITY_NORMALIZER), 0, 1);
     const equality = computeEquality(runtime.agents.map((agent) => agent.wealth));
     const welfare = clamp(
       productivity * (0.54 - policy.fairnessWeight * 0.15) +
@@ -789,7 +1049,11 @@ function simulateYear(
     agent.taxYear = 0;
   }
 
-  const finalProductivity = clamp(runtime.productivityAccumulator / (year * config.stepsPerYear * 3.6), 0, 1);
+  const finalProductivity = clamp(
+    runtime.productivityAccumulator / (year * config.stepsPerYear * PRODUCTIVITY_NORMALIZER),
+    0,
+    1
+  );
   const finalEquality = computeEquality(runtime.agents.map((agent) => agent.wealth));
   const finalWelfare = clamp(
     finalProductivity * (0.54 - policy.fairnessWeight * 0.15) +
@@ -815,7 +1079,7 @@ function simulateYear(
   };
 }
 
-function trainQLearningPlanner(config: ScenarioConfig): QLearningBundle {
+function trainQLearningPlanner(config: ScenarioConfig, agentActionBundle: AgentActionBundle): QLearningBundle {
   const episodes = Math.max(48, Math.min(96, config.years * 8));
   const alpha = 0.18;
   const gamma = 0.92;
@@ -828,6 +1092,7 @@ function trainQLearningPlanner(config: ScenarioConfig): QLearningBundle {
     const episodeSeed = config.seed + episode * 97 + 11;
     const runtime = createRuntime(config, episodeSeed);
     const episodeRandom = mulberry32(episodeSeed + 1);
+    const agentActionPlanner = agentActionBundle.createPlanner(runtime.random);
     let metrics = createInitialMetrics(runtime);
     let totalReward = 0;
     const epsilon = epsilonStart + (epsilonEnd - epsilonStart) * (episode / Math.max(episodes - 1, 1));
@@ -836,7 +1101,7 @@ function trainQLearningPlanner(config: ScenarioConfig): QLearningBundle {
       const state = encodeState(metrics, year, config.objective);
       const qValues = ensureQRow(qTable, state);
       const actionIndex = chooseEpsilonGreedy(qValues, episodeRandom, epsilon);
-      const result = simulateYear(runtime, config, LEARNABLE_POLICIES[actionIndex], year, null);
+      const result = simulateYear(runtime, config, LEARNABLE_POLICIES[actionIndex], year, null, agentActionPlanner);
       const reward = computeReward(result.metrics, config.objective);
       totalReward += reward;
 
@@ -877,12 +1142,88 @@ function trainQLearningPlanner(config: ScenarioConfig): QLearningBundle {
   };
 }
 
+function createAgentActionPlanner(
+  qTable: Map<string, number[]>,
+  random: () => number,
+  epsilon: number,
+  alpha: number,
+  gamma: number,
+  learning: boolean,
+  actionUsage?: ActionSummary
+): AgentActionPlanner {
+  return {
+    actionUsage,
+    chooseAction: (agent, runtime, config, policy, year) => {
+      const state = encodeAgentActionState(agent, runtime, config, policy, year);
+      const qValues = ensureAgentQRow(qTable, state);
+      return chooseAgentActionFromQ(qValues, getAvailableAgentActions(agent, runtime, config), random, epsilon);
+    },
+    observe: learning
+      ? (state, action, reward, nextState) => {
+          const qValues = ensureAgentQRow(qTable, state);
+          const actionIndex = LEARNABLE_AGENT_ACTIONS.indexOf(action);
+          const nextMax = Math.max(...ensureAgentQRow(qTable, nextState));
+          qValues[actionIndex] += alpha * (reward + gamma * nextMax - qValues[actionIndex]);
+        }
+      : undefined
+  };
+}
+
+function trainAgentActionPlanner(config: ScenarioConfig): AgentActionBundle {
+  const episodes = Math.max(36, Math.min(72, config.years * 6));
+  const alpha = 0.16;
+  const gamma = 0.9;
+  const epsilonStart = 0.36;
+  const epsilonEnd = 0.06;
+  const qTable = new Map<string, number[]>();
+  const rewards: number[] = [];
+  const actionUsage = seedActionSummary();
+
+  for (let episode = 0; episode < episodes; episode += 1) {
+    const episodeSeed = config.seed + episode * 131 + 23;
+    const runtime = createRuntime(config, episodeSeed);
+    const episodeRandom = mulberry32(episodeSeed + 5);
+    const epsilon = epsilonStart + (epsilonEnd - epsilonStart) * (episode / Math.max(episodes - 1, 1));
+    const planner = createAgentActionPlanner(qTable, episodeRandom, epsilon, alpha, gamma, true, actionUsage);
+    let totalReward = 0;
+
+    for (let year = 1; year <= config.years; year += 1) {
+      const policy =
+        config.policyId === "rl_planner"
+          ? LEARNABLE_POLICIES[(year + episode) % LEARNABLE_POLICIES.length]
+          : getPolicyById(config.policyId);
+      const before = createInitialMetrics(runtime);
+      const result = simulateYear(runtime, config, policy, year, null, planner);
+      totalReward += computeReward(result.metrics, config.objective) - computeReward(before, config.objective);
+    }
+
+    rewards.push(totalReward);
+  }
+
+  return {
+    summary: {
+      algorithm: "Q-learning",
+      episodes,
+      alpha,
+      gamma,
+      epsilonStart,
+      epsilonEnd,
+      averageReward: round2(average(rewards)),
+      learnedStates: qTable.size,
+      actionUsage
+    },
+    createPlanner: (random: () => number) => createAgentActionPlanner(qTable, random, 0, alpha, gamma, false)
+  };
+}
+
 function runEpisode(
   config: ScenarioConfig,
   topPolicy: Policy,
-  choosePolicy: (year: number, metrics: MacroMetrics) => RLPolicyTrace
+  choosePolicy: (year: number, metrics: MacroMetrics) => RLPolicyTrace,
+  agentActionBundle: AgentActionBundle
 ): { frames: StepSnapshot[]; highlights: string[]; finalSummary: string; policyTrace: RLPolicyTrace[] } {
   const runtime = createRuntime(config, config.seed);
+  const agentActionPlanner = agentActionBundle.createPlanner(runtime.random);
   const frames: StepSnapshot[] = [];
   const highlights: string[] = [];
   const policyTrace: RLPolicyTrace[] = [];
@@ -891,7 +1232,7 @@ function runEpisode(
   for (let year = 1; year <= config.years; year += 1) {
     const yearlyDecision = choosePolicy(year, metrics);
     const policy = getPolicyById(yearlyDecision.policyId);
-    const result = simulateYear(runtime, config, policy, year, frames);
+    const result = simulateYear(runtime, config, policy, year, frames, agentActionPlanner);
     const reward = computeReward(result.metrics, config.objective);
     policyTrace.push({
       ...yearlyDecision,
@@ -1130,9 +1471,11 @@ export function createDefaultConfig(): ScenarioConfig {
 }
 
 export function runSimulation(config: ScenarioConfig): SimulationRun {
+  const trainedAgentActions = trainAgentActionPlanner(config);
+
   if (config.policyId === "rl_planner") {
-    const trainedPlanner = trainQLearningPlanner(config);
-    const run = runEpisode(config, RL_POLICY, trainedPlanner.choosePolicy);
+    const trainedPlanner = trainQLearningPlanner(config, trainedAgentActions);
+    const run = runEpisode(config, RL_POLICY, trainedPlanner.choosePolicy, trainedAgentActions);
     return {
       config,
       policy: RL_POLICY,
@@ -1142,7 +1485,8 @@ export function runSimulation(config: ScenarioConfig): SimulationRun {
       rlTraining: {
         ...trainedPlanner.summary,
         policyTrace: run.policyTrace
-      }
+      },
+      agentTraining: trainedAgentActions.summary
     };
   }
 
@@ -1154,7 +1498,7 @@ export function runSimulation(config: ScenarioConfig): SimulationRun {
     policyName: topPolicy.name,
     reward: 0,
     qValues: []
-  }));
+  }), trainedAgentActions);
 
   return {
     config,
@@ -1162,7 +1506,8 @@ export function runSimulation(config: ScenarioConfig): SimulationRun {
     frames: run.frames,
     highlights: run.highlights,
     finalSummary: run.finalSummary,
-    rlTraining: null
+    rlTraining: null,
+    agentTraining: trainedAgentActions.summary
   };
 }
 
